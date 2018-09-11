@@ -97,6 +97,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 		allocs = append(allocs, allocator)
 
 		result.IPs = append(result.IPs, ipConf)
+		if rng, err := rangeset.RangeFor(ipConf.Address.IP); err == nil {
+			if rng.Ipv6Prefix != "" {
+				if ipConf6 := ipv6Conf(rng.Ipv6Prefix, ipConf); ipConf6 != nil {
+					result.IPs = append(result.IPs, ipConf6)
+				}
+			}
+		}
 	}
 
 	// If an IP was requested that wasn't fulfilled, fail
@@ -114,6 +121,32 @@ func cmdAdd(args *skel.CmdArgs) error {
 	result.Routes = ipamConf.Routes
 
 	return types.PrintResult(result, confVersion)
+}
+
+func ipv6Conf(prefix string, ipConf *current.IPConfig) *current.IPConfig {
+	_, n, err := net.ParseCIDR(prefix)
+	if err != nil {
+		return nil
+	}
+	if n.IP.To16() == nil {
+		return nil
+	}
+	
+	var ipConf6 current.IPConfig
+	ipConf6.Version = "6"
+	ipConf6.Address = *n
+	appendIpv4(ipConf6.Address.IP, ipConf.Address.IP)
+	ipConf6.Gateway = make(net.IP, 16)
+	copy(ipConf6.Gateway, n.IP)
+	appendIpv4(ipConf6.Gateway, ipConf.Gateway)
+	return &ipConf6
+}
+
+func appendIpv4(ip6 net.IP, ip4 net.IP) {
+	ip6[12] = ip4[0]
+	ip6[13] = ip4[1]
+	ip6[14] = ip4[2]
+	ip6[15] = ip4[3]
 }
 
 func cmdDel(args *skel.CmdArgs) error {

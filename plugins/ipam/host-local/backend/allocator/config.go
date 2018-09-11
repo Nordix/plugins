@@ -66,6 +66,7 @@ type Range struct {
 	RangeStart net.IP      `json:"rangeStart,omitempty"` // The first ip, inclusive
 	RangeEnd   net.IP      `json:"rangeEnd,omitempty"`   // The last ip, inclusive
 	Subnet     types.IPNet `json:"subnet"`
+	Ipv6Prefix string      `json:"ipv6Prefix,omitempty"`
 	Gateway    net.IP      `json:"gateway,omitempty"`
 }
 
