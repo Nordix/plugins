@@ -40,8 +40,20 @@ import (
 )
 
 const (
-	sysBusPCI = "/sys/bus/pci/devices"
+	sysBusPCI       = "/sys/bus/pci/devices"
+	baseDevInfoPath = "/var/run/cni/devinfo"
 )
+
+// PciConfigSnapshotInfo is the pci-specific device information that shall be snapshotted
+type PciConfigSnapshotInfo struct {
+	PciAddress string `json:"address"`
+}
+
+// PciSnapshotInfo is the device information that shall be snapshotted
+type PciSnapshotInfo struct {
+	DevType string                `json:"type"`
+	Config  PciConfigSnapshotInfo `json:"pci,omitempty"`
+}
 
 //NetConf for host-device config, look the README to learn how to use those parameters
 type NetConf struct {
@@ -99,6 +111,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	contDev, err := moveLinkIn(hostDev, containerNs, args.IfName)
 	if err != nil {
 		return fmt.Errorf("failed to move link %v", err)
+	}
+
+	if cfg.PCIAddr != "" {
+		err := storeDeviceInfo(cfg.Name, cfg.PCIAddr)
+		if err != nil {
+			return err
+		}
 	}
 
 	var result *current.Result
@@ -176,6 +195,10 @@ func cmdDel(args *skel.CmdArgs) error {
 		if err := ipam.ExecDel(cfg.IPAM.Type, args.StdinData); err != nil {
 			return err
 		}
+	}
+
+	if cfg.PCIAddr != "" {
+		removeDeviceInfo(cfg.Name, cfg.PCIAddr)
 	}
 
 	return nil
@@ -328,6 +351,40 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 	}
 
 	return nil, fmt.Errorf("failed to find physical interface")
+}
+
+func storeDeviceInfo(netName, deviceID string) error {
+	devInfoPath := fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netName, deviceID)
+	if err := os.MkdirAll(devInfoPath, os.ModeDir); err != nil {
+		return err
+	}
+
+	info := PciSnapshotInfo{
+		DevType: "pci",
+		Config: PciConfigSnapshotInfo{
+			PciAddress: deviceID,
+		},
+	}
+
+	infoJSON, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+
+	if err := ioutil.WriteFile(fmt.Sprintf("%s/%s", devInfoPath, "device.json"), infoJSON, 0444); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func removeDeviceInfo(netName, deviceID string) {
+	devInfoPath := fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netName, deviceID)
+	_, err := os.Stat(devInfoPath)
+	if os.IsNotExist(err) {
+		return
+	}
+	os.RemoveAll(devInfoPath)
 }
 
 func main() {
