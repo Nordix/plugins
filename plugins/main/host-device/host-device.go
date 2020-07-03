@@ -41,7 +41,7 @@ import (
 
 const (
 	sysBusPCI       = "/sys/bus/pci/devices"
-	baseDevInfoPath = "/var/run/cni/devinfo"
+	baseDevInfoPath = "/var/run/cni.npwg.cncf.io/devinfo"
 )
 
 // PciConfigSnapshotInfo is the pci-specific device information that shall be snapshotted
@@ -58,10 +58,11 @@ type PciSnapshotInfo struct {
 //NetConf for host-device config, look the README to learn how to use those parameters
 type NetConf struct {
 	types.NetConf
-	Device        string `json:"device"`     // Device-Name, something like eth0 or can0 etc.
-	HWAddr        string `json:"hwaddr"`     // MAC Address of target network interface
-	KernelPath    string `json:"kernelpath"` // Kernelpath of the device
-	PCIAddr       string `json:"pciBusID"`   // PCI Address of target network device
+	Device        string `json:"device"`       // Device-Name, something like eth0 or can0 etc.
+	HWAddr        string `json:"hwaddr"`       // MAC Address of target network interface
+	KernelPath    string `json:"kernelpath"`   // Kernelpath of the device
+	PCIAddr       string `json:"pciBusID"`     // PCI Address of target network device
+	ResourceName  string `json:"resourceName"` // Resource Name on which device belongs to
 	RuntimeConfig struct {
 		DeviceID string `json:"deviceID,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
@@ -74,26 +75,28 @@ func init() {
 	runtime.LockOSThread()
 }
 
-func loadConf(bytes []byte) (*NetConf, error) {
+func loadConf(bytes []byte) (*NetConf, bool, error) {
 	n := &NetConf{}
+	isRuntimeConfig := false
 	if err := json.Unmarshal(bytes, n); err != nil {
-		return nil, fmt.Errorf("failed to load netconf: %v", err)
+		return nil, isRuntimeConfig, fmt.Errorf("failed to load netconf: %v", err)
 	}
 
 	if n.RuntimeConfig.DeviceID != "" {
 		// Override PCI device with the standardized DeviceID provided in Runtime Config.
 		n.PCIAddr = n.RuntimeConfig.DeviceID
+		isRuntimeConfig = true
 	}
 
 	if n.Device == "" && n.HWAddr == "" && n.KernelPath == "" && n.PCIAddr == "" {
-		return nil, fmt.Errorf(`specify either "device", "hwaddr", "kernelpath" or "pciBusID"`)
+		return nil, isRuntimeConfig, fmt.Errorf(`specify either "device", "hwaddr", "kernelpath" or "pciBusID"`)
 	}
 
-	return n, nil
+	return n, isRuntimeConfig, nil
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	cfg, err := loadConf(args.StdinData)
+	cfg, isRuntimeConfig, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
@@ -114,7 +117,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	if cfg.PCIAddr != "" {
-		err := storeDeviceInfo(cfg.Name, cfg.PCIAddr)
+		err := storeDeviceInfo(cfg.ResourceName, cfg.Name, cfg.PCIAddr, isRuntimeConfig)
 		if err != nil {
 			return err
 		}
@@ -174,7 +177,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	cfg, err := loadConf(args.StdinData)
+	cfg, isRuntimeConfig, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
@@ -198,7 +201,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	if cfg.PCIAddr != "" {
-		removeDeviceInfo(cfg.Name, cfg.PCIAddr)
+		removeDeviceInfo(cfg.ResourceName, cfg.Name, cfg.PCIAddr, isRuntimeConfig)
 	}
 
 	return nil
@@ -353,8 +356,11 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 	return nil, fmt.Errorf("failed to find physical interface")
 }
 
-func storeDeviceInfo(netName, deviceID string) error {
-	devInfoPath := fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netName, deviceID)
+func storeDeviceInfo(resourceName, netName, deviceID string, isRuntimeConfig bool) error {
+	if isDeviceFileExists(resourceName, deviceID) {
+		return nil
+	}
+	devInfoPath := getDeviceInfoPath(netName, deviceID, isRuntimeConfig)
 	if err := os.MkdirAll(devInfoPath, os.ModeDir); err != nil {
 		return err
 	}
@@ -378,13 +384,37 @@ func storeDeviceInfo(netName, deviceID string) error {
 	return nil
 }
 
-func removeDeviceInfo(netName, deviceID string) {
-	devInfoPath := fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netName, deviceID)
+func isDeviceFileExists(resourceName, deviceID string) bool {
+	if resourceName == "" {
+		return false
+	}
+	_, err := os.Stat(fmt.Sprintf("%s/%s/%s/%s", "/var/run/dp.npwg.cncf.io/devinfo", resourceName, deviceID, "device.json"))
+	if err != nil && os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+func removeDeviceInfo(resourceName, netName, deviceID string, isRuntimeConfig bool) {
+	if isDeviceFileExists(resourceName, deviceID) {
+		return
+	}
+	devInfoPath := getDeviceInfoPath(netName, deviceID, isRuntimeConfig)
 	_, err := os.Stat(devInfoPath)
-	if os.IsNotExist(err) {
+	if err != nil && os.IsNotExist(err) {
 		return
 	}
 	os.RemoveAll(devInfoPath)
+}
+
+func getDeviceInfoPath(netOrResourceName, deviceID string, isRuntimeConfig bool) string {
+	var devInfoPath string
+	if isRuntimeConfig {
+		devInfoPath = fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netOrResourceName, deviceID)
+	} else {
+		devInfoPath = fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netOrResourceName, "default")
+	}
+	return devInfoPath
 }
 
 func main() {
@@ -393,7 +423,7 @@ func main() {
 
 func cmdCheck(args *skel.CmdArgs) error {
 
-	cfg, err := loadConf(args.StdinData)
+	cfg, _, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
