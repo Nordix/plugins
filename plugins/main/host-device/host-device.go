@@ -33,6 +33,8 @@ import (
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
 
+	nadapi "github.com/amorenoz/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	nadutil "github.com/amorenoz/network-attachment-definition-client/pkg/utils"
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -40,20 +42,8 @@ import (
 )
 
 const (
-	sysBusPCI       = "/sys/bus/pci/devices"
-	baseDevInfoPath = "/var/run/cni.npwg.cncf.io/devinfo"
+	sysBusPCI = "/sys/bus/pci/devices"
 )
-
-// PciConfigSnapshotInfo is the pci-specific device information that shall be snapshotted
-type PciConfigSnapshotInfo struct {
-	PciAddress string `json:"address"`
-}
-
-// PciSnapshotInfo is the device information that shall be snapshotted
-type PciSnapshotInfo struct {
-	DevType string                `json:"type"`
-	Config  PciConfigSnapshotInfo `json:"pci,omitempty"`
-}
 
 //NetConf for host-device config, look the README to learn how to use those parameters
 type NetConf struct {
@@ -62,7 +52,7 @@ type NetConf struct {
 	HWAddr        string `json:"hwaddr"`       // MAC Address of target network interface
 	KernelPath    string `json:"kernelpath"`   // Kernelpath of the device
 	PCIAddr       string `json:"pciBusID"`     // PCI Address of target network device
-	ResourceName  string `json:"resourceName"` // Resource Name on which device belongs to
+	ResourceName  string `json:"resourceName"` // Resource Name on which device belongs
 	RuntimeConfig struct {
 		DeviceID string `json:"deviceID,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
@@ -75,28 +65,36 @@ func init() {
 	runtime.LockOSThread()
 }
 
-func loadConf(bytes []byte) (*NetConf, bool, error) {
+func loadConf(bytes []byte) (*NetConf, error) {
 	n := &NetConf{}
-	isRuntimeConfig := false
 	if err := json.Unmarshal(bytes, n); err != nil {
-		return nil, isRuntimeConfig, fmt.Errorf("failed to load netconf: %v", err)
+		return nil, fmt.Errorf("failed to load netconf: %v", err)
 	}
 
 	if n.RuntimeConfig.DeviceID != "" {
 		// Override PCI device with the standardized DeviceID provided in Runtime Config.
 		n.PCIAddr = n.RuntimeConfig.DeviceID
-		isRuntimeConfig = true
+	}
+
+	if n.PCIAddr != "" && n.ResourceName != "" {
+		// The devicePlugin might have stored the address in the standard path
+		devInfo, err := nadutil.LoadDeviceInfoFromDP(n.ResourceName, n.PCIAddr)
+		if err != nil || devInfo.Type != "pci" {
+			return nil, fmt.Errorf("LoadConf(): Failed to load pci device information (%v) trying with deviceID == pciAddress", err)
+		} else {
+			n.PCIAddr = devInfo.Pci.Address
+		}
 	}
 
 	if n.Device == "" && n.HWAddr == "" && n.KernelPath == "" && n.PCIAddr == "" {
-		return nil, isRuntimeConfig, fmt.Errorf(`specify either "device", "hwaddr", "kernelpath" or "pciBusID"`)
+		return nil, fmt.Errorf(`specify either "device", "hwaddr", "kernelpath" or "pciBusID"`)
 	}
 
-	return n, isRuntimeConfig, nil
+	return n, nil
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	cfg, isRuntimeConfig, err := loadConf(args.StdinData)
+	cfg, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
@@ -117,7 +115,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	if cfg.PCIAddr != "" {
-		err := storeDeviceInfo(cfg.ResourceName, cfg.Name, cfg.PCIAddr, isRuntimeConfig)
+		err = storeDeviceInfo(cfg)
 		if err != nil {
 			return err
 		}
@@ -177,10 +175,11 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	cfg, isRuntimeConfig, err := loadConf(args.StdinData)
+	cfg, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
+
 	if args.Netns == "" {
 		return nil
 	}
@@ -200,8 +199,8 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 	}
 
-	if cfg.PCIAddr != "" {
-		removeDeviceInfo(cfg.ResourceName, cfg.Name, cfg.PCIAddr, isRuntimeConfig)
+	if err := cleanDeviceInfo(cfg); err != nil {
+		return err
 	}
 
 	return nil
@@ -356,74 +355,41 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 	return nil, fmt.Errorf("failed to find physical interface")
 }
 
-func storeDeviceInfo(resourceName, netName, deviceID string, isRuntimeConfig bool) error {
-	if isDeviceFileExists(resourceName, deviceID) {
+func cleanDeviceInfo(n *NetConf) error {
+	if n.ResourceName != "" {
 		return nil
 	}
-	devInfoPath := getDeviceInfoPath(netName, deviceID, isRuntimeConfig)
-	if err := os.MkdirAll(devInfoPath, os.ModeDir); err != nil {
-		return err
+	if n.RuntimeConfig.DeviceID == "" {
+		return nadutil.CleanDefaultCNIDeviceInfo(n.Name)
+	} else {
+		return nadutil.CleanCNIDeviceInfo(n.Name, n.RuntimeConfig.DeviceID)
 	}
+}
 
-	info := PciSnapshotInfo{
-		DevType: "pci",
-		Config: PciConfigSnapshotInfo{
-			PciAddress: deviceID,
+func storeDeviceInfo(n *NetConf) error {
+	if n.ResourceName != "" {
+		return nil
+	}
+	devInfo := nadapi.DeviceInfo{
+		Type: "pci",
+		Pci: &nadapi.PciDevice{
+			Address: n.PCIAddr,
 		},
 	}
-
-	infoJSON, err := json.Marshal(info)
-	if err != nil {
-		return err
-	}
-
-	if err := ioutil.WriteFile(fmt.Sprintf("%s/%s", devInfoPath, "device.json"), infoJSON, 0444); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func isDeviceFileExists(resourceName, deviceID string) bool {
-	if resourceName == "" {
-		return false
-	}
-	_, err := os.Stat(fmt.Sprintf("%s/%s/%s/%s", "/var/run/dp.npwg.cncf.io/devinfo", resourceName, deviceID, "device.json"))
-	if err != nil && os.IsNotExist(err) {
-		return false
-	}
-	return true
-}
-
-func removeDeviceInfo(resourceName, netName, deviceID string, isRuntimeConfig bool) {
-	if isDeviceFileExists(resourceName, deviceID) {
-		return
-	}
-	devInfoPath := getDeviceInfoPath(netName, deviceID, isRuntimeConfig)
-	_, err := os.Stat(devInfoPath)
-	if err != nil && os.IsNotExist(err) {
-		return
-	}
-	os.RemoveAll(devInfoPath)
-}
-
-func getDeviceInfoPath(netOrResourceName, deviceID string, isRuntimeConfig bool) string {
-	var devInfoPath string
-	if isRuntimeConfig {
-		devInfoPath = fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netOrResourceName, deviceID)
+	if n.RuntimeConfig.DeviceID == "" {
+		return nadutil.SaveCNIDefaultDeviceInfo(n.Name, &devInfo)
 	} else {
-		devInfoPath = fmt.Sprintf("%s/%s/%s/", baseDevInfoPath, netOrResourceName, "default")
+		return nadutil.SaveCNIDeviceInfo(n.Name, n.RuntimeConfig.DeviceID, &devInfo)
 	}
-	return devInfoPath
-}
 
+}
 func main() {
 	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, bv.BuildString("host-device"))
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
 
-	cfg, _, err := loadConf(args.StdinData)
+	cfg, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
 	}
