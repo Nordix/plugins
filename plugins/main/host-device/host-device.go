@@ -79,7 +79,7 @@ func loadConf(bytes []byte) (*NetConf, error) {
 	if n.PCIAddr != "" && n.ResourceName != "" {
 		// The devicePlugin might have stored the address in the standard path
 		devInfo, err := nadutil.LoadDeviceInfoFromDP(n.ResourceName, n.PCIAddr)
-		if err != nil || devInfo.Type != "pci" {
+		if err != nil || devInfo == nil || devInfo.Type != "pci" {
 			return nil, fmt.Errorf("LoadConf(): Failed to load pci device information (%v) trying with deviceID == pciAddress", err)
 		} else {
 			n.PCIAddr = devInfo.Pci.Address
